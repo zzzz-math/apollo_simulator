@@ -14,10 +14,8 @@
  * limitations under the License.
  *****************************************************************************/
 #include "modules/control/controller/lon_controller.h"
-
 #include <algorithm>
 #include <utility>
-
 #include "absl/strings/str_cat.h"
 #include "cyber/common/log.h"
 #include "cyber/time/clock.h"
@@ -26,10 +24,8 @@
 #include "modules/common/math/math_utils.h"
 #include "modules/control/common/control_gflags.h"
 #include "modules/localization/common/localization_gflags.h"
-
 namespace apollo {
 namespace control {
-
 using apollo::common::ErrorCode;
 using apollo::common::Status;
 using apollo::common::TrajectoryPoint;
@@ -228,7 +224,7 @@ Status LonController::ComputeControlCommand(
   }
 
   double speed_offset =
-      station_pid_controller_.Control(station_error_limited, ts);
+      station_pid_controller_.Control((0910-question), ts);
   if (enable_leadlag) {
     speed_offset = station_leadlag_controller_.Control(speed_offset, ts);
   }
@@ -249,7 +245,7 @@ Status LonController::ComputeControlCommand(
   double acceleration_cmd_closeloop = 0.0;
 
   acceleration_cmd_closeloop =
-      speed_pid_controller_.Control(speed_controller_input_limited, ts);
+      speed_pid_controller_.Control((0910-question), ts);
   debug->set_pid_saturation_status(
       speed_pid_controller_.IntegratorSaturationStatus());
   if (enable_leadlag) {
