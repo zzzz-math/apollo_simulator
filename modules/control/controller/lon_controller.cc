@@ -14,18 +14,21 @@
  * limitations under the License.
  *****************************************************************************/
 #include "modules/control/controller/lon_controller.h"
+
 #include <algorithm>
 #include <utility>
+
 #include "absl/strings/str_cat.h"
 #include "cyber/common/log.h"
-#include "cyber/time/clock.h"
 #include "cyber/time/time.h"
 #include "modules/common/configs/vehicle_config_helper.h"
 #include "modules/common/math/math_utils.h"
 #include "modules/control/common/control_gflags.h"
 #include "modules/localization/common/localization_gflags.h"
+
 namespace apollo {
 namespace control {
+
 using apollo::common::ErrorCode;
 using apollo::common::Status;
 using apollo::common::TrajectoryPoint;
@@ -63,7 +66,6 @@ LonController::LonController()
               "acceleration_cmd_closeloop,"
               "acceleration_cmd,"
               "acceleration_lookup,"
-              "acceleration_lookup_limit,"
               "speed_lookup,"
               "calibration_value,"
               "throttle_cmd,"
@@ -216,15 +218,13 @@ Status LonController::ComputeControlCommand(
     }
   } else if (injector_->vehicle_state()->linear_velocity() <=
              lon_controller_conf.switch_speed()) {
-    station_pid_controller_.SetPID(lon_controller_conf.station_pid_conf());
     speed_pid_controller_.SetPID(lon_controller_conf.low_speed_pid_conf());
   } else {
-    station_pid_controller_.SetPID(lon_controller_conf.station_pid_conf());
     speed_pid_controller_.SetPID(lon_controller_conf.high_speed_pid_conf());
   }
 
   double speed_offset =
-      station_pid_controller_.Control(0910-question, ts);
+      station_pid_controller_.Control(station_error_limited, ts);
   if (enable_leadlag) {
     speed_offset = station_leadlag_controller_.Control(speed_offset, ts);
   }
@@ -245,7 +245,7 @@ Status LonController::ComputeControlCommand(
   double acceleration_cmd_closeloop = 0.0;
 
   acceleration_cmd_closeloop =
-      speed_pid_controller_.Control(0910-question, ts);
+      speed_pid_controller_.Control(speed_controller_input_limited, ts);
   debug->set_pid_saturation_status(
       speed_pid_controller_.IntegratorSaturationStatus());
   if (enable_leadlag) {
@@ -253,11 +253,6 @@ Status LonController::ComputeControlCommand(
         speed_leadlag_controller_.Control(acceleration_cmd_closeloop, ts);
     debug->set_leadlag_saturation_status(
         speed_leadlag_controller_.InnerstateSaturationStatus());
-  }
-
-  if (chassis->gear_location() == canbus::Chassis::GEAR_NEUTRAL) {
-    speed_pid_controller_.Reset_integral();
-    station_pid_controller_.Reset_integral();
   }
 
   double slope_offset_compensation = digital_filter_pitch_angle_.Filter(
@@ -275,22 +270,10 @@ Status LonController::ComputeControlCommand(
   debug->set_is_full_stop(false);
   GetPathRemain(debug);
 
-  if ((trajectory_message_->trajectory_type() ==
-       apollo::planning::ADCTrajectory::UNKNOWN) &&
-      std::abs(cmd->steering_target() - chassis->steering_percentage()) > 20) {
-    acceleration_cmd = 0;
-    ADEBUG << "Steering not reached";
-    debug->set_is_full_stop(true);
-    speed_pid_controller_.Reset_integral();
-    station_pid_controller_.Reset_integral();
-  }
-
   // At near-stop stage, replace the brake control command with the standstill
   // acceleration if the former is even softer than the latter
-  if (((trajectory_message_->trajectory_type() ==
-        apollo::planning::ADCTrajectory::NORMAL) ||
-       (trajectory_message_->trajectory_type() ==
-        apollo::planning::ADCTrajectory::SPEED_FALLBACK)) &&
+  if ((trajectory_message_->trajectory_type() ==
+       apollo::planning::ADCTrajectory::NORMAL) &&
       ((std::fabs(debug->preview_acceleration_reference()) <=
             control_conf_->max_acceleration_when_stopped() &&
         std::fabs(debug->preview_speed_reference()) <=
@@ -305,8 +288,6 @@ Status LonController::ComputeControlCommand(
                        lon_controller_conf.standstill_acceleration());
     ADEBUG << "Stop location reached";
     debug->set_is_full_stop(true);
-    speed_pid_controller_.Reset_integral();
-    station_pid_controller_.Reset_integral();
   }
 
   double throttle_lowerbound =
@@ -321,34 +302,12 @@ Status LonController::ComputeControlCommand(
           ? -acceleration_cmd
           : acceleration_cmd;
 
-  double acceleration_lookup_limited =
-      vehicle_param_.max_acceleration() +
-      FLAGS_enable_slope_offset * debug->slope_offset_compensation();
-  double acceleration_lookup_limit = 0.0;
-
-  if (FLAGS_use_acceleration_lookup_limit) {
-    acceleration_lookup_limit =
-        (acceleration_lookup > acceleration_lookup_limited)
-            ? acceleration_lookup_limited
-            : acceleration_lookup;
-  }
-
   if (FLAGS_use_preview_speed_for_table) {
-    if (FLAGS_use_acceleration_lookup_limit) {
-      calibration_value = control_interpolation_->Interpolate(std::make_pair(
-          debug->preview_speed_reference(), acceleration_lookup_limit));
-    } else {
-      calibration_value = control_interpolation_->Interpolate(std::make_pair(
-          debug->preview_speed_reference(), acceleration_lookup));
-    }
+    calibration_value = control_interpolation_->Interpolate(
+        std::make_pair(debug->preview_speed_reference(), acceleration_lookup));
   } else {
-    if (FLAGS_use_acceleration_lookup_limit) {
-      calibration_value = control_interpolation_->Interpolate(
-          std::make_pair(chassis_->speed_mps(), acceleration_lookup_limit));
-    } else {
-      calibration_value = control_interpolation_->Interpolate(
-          std::make_pair(chassis_->speed_mps(), acceleration_lookup));
-    }
+    calibration_value = control_interpolation_->Interpolate(
+        std::make_pair(chassis_->speed_mps(), acceleration_lookup));
   }
 
   if (acceleration_lookup >= 0) {
@@ -374,7 +333,6 @@ Status LonController::ComputeControlCommand(
   debug->set_throttle_cmd(throttle_cmd);
   debug->set_brake_cmd(brake_cmd);
   debug->set_acceleration_lookup(acceleration_lookup);
-  debug->set_acceleration_lookup_limit(acceleration_lookup_limit);
   debug->set_speed_lookup(chassis_->speed_mps());
   debug->set_calibration_value(calibration_value);
   debug->set_acceleration_cmd_closeloop(acceleration_cmd_closeloop);
@@ -390,22 +348,17 @@ Status LonController::ComputeControlCommand(
             debug->preview_speed_error(),
             debug->preview_acceleration_reference(), acceleration_cmd_closeloop,
             acceleration_cmd, debug->acceleration_lookup(),
-            debug->acceleration_lookup_limit(), debug->speed_lookup(),
-            calibration_value, throttle_cmd, brake_cmd, debug->is_full_stop());
+            debug->speed_lookup(), calibration_value, throttle_cmd, brake_cmd,
+            debug->is_full_stop());
   }
 
   // if the car is driven by acceleration, disgard the cmd->throttle and brake
   cmd->set_throttle(throttle_cmd);
   cmd->set_brake(brake_cmd);
-  if (FLAGS_use_acceleration_lookup_limit) {
-    cmd->set_acceleration(acceleration_lookup_limit);
-  } else {
-    cmd->set_acceleration(acceleration_cmd);
-  }
+  cmd->set_acceleration(acceleration_cmd);
 
   if (std::fabs(injector_->vehicle_state()->linear_velocity()) <=
           vehicle_param_.max_abs_speed_when_stopped() ||
-      chassis->gear_location() == trajectory_message_->gear() ||
       chassis->gear_location() == canbus::Chassis::GEAR_NEUTRAL) {
     cmd->set_gear_location(trajectory_message_->gear());
   } else {
@@ -445,8 +398,7 @@ void LonController::ComputeLongitudinalErrors(
       vehicle_state->linear_velocity(), matched_point, &s_matched,
       &s_dot_matched, &d_matched, &d_dot_matched);
 
-  // double current_control_time = Time::Now().ToSecond();
-  double current_control_time = ::apollo::cyber::Clock::NowInSeconds();
+  double current_control_time = Time::Now().ToSecond();
   double preview_control_time = current_control_time + preview_time;
 
   TrajectoryPoint reference_point =
